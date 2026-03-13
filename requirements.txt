@@ -15,4 +15,3 @@ seaborn
 matplotlib
 PyPortfolioOpt
 XlsxWriter
-hashlib
