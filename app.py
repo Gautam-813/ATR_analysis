@@ -456,7 +456,7 @@ with t7:
                            category_orders={'Day_Name': d_order},
                            color='Avg_ATR', color_continuous_scale='Blues',
                            template='plotly_white')
-            st.plotly_chart(fig_d, use_container_width=True)
+            st.plotly_chart(fig_d, width="stretch")
         
         with col_q2:
             st.markdown("#### 🗓️ Monthly Seasonality")
