@@ -1,0 +1,14 @@
+# Streamlit secrets
+.streamlit/secrets.toml
+
+# Other secret files
+.secrets.toml
+secrets.toml
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Data files (usually too large for GitHub)
+*.parquet
+*.csv
