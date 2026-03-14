@@ -227,6 +227,22 @@ if raw is None:
 raw_dxy = load_asset_data("DXY")
 raw_eur = load_asset_data("EURUSD")
 
+# AI Analysis Symbol Selection
+st.sidebar.divider()
+st.sidebar.subheader("🌍 AI Asset Context")
+st.sidebar.caption("Select instruments to load into the AI's memory.")
+
+ai_symbols = []
+if st.sidebar.checkbox("GOLD (XAUUSD)", value=True):
+    ai_symbols.append("GOLD")
+if raw_dxy is not None:
+    if st.sidebar.checkbox("DXY (US Dollar Index)", value=True):
+        ai_symbols.append("DXY")
+if raw_eur is not None:
+    if st.sidebar.checkbox("EURUSD Data", value=True):
+        ai_symbols.append("EURUSD")
+
+
 # Standard Calculations for Gold (Main Dashboard)
 daily, sessions = resample_and_calculate(raw, tf_opt[sel_tf], atr_p)
 
@@ -654,134 +670,167 @@ with t10:
         user_question = st.text_input("Ask a question about the dataset (e.g., 'What was the highest ATR in 2024?')")
         
         if user_question:
-            # Create unique cache key for this question + model
-            cache_key = hashlib.md5((user_question + sel_model_name).encode()).hexdigest()
+            if not ai_symbols:
+                st.warning("Please select at least one asset in the sidebar for the AI to analyze.")
+                st.stop()
+                
+            # Create unique cache key for this question + model + symbols
+            cache_key = hashlib.md5((user_question + sel_model_name + "".join(ai_symbols)).encode()).hexdigest()
             
-            # Prepare dataframes for AI
-            df_for_ai = filtered_daily.copy() # Aggregated
+            # Prepare dataframes and globals dynamically
+            df_for_ai = filtered_daily.copy() # Aggregated Gold
             
-            # 1. Fetch Code (from Cache or API)
+            agg_str = []
+            raw_str = []
+            safe_globals = {
+                "pd": pd, "np": np, "px": px, "go": go, "ta": ta, "qs": qs, 
+                "stats": stats, "sk": sklearn, "sm": sm, "arch": arch_model, 
+                "sns": sns, "plt": plt, "pypopt": pypfopt, "xlsx": xlsxwriter, 
+                "dt": datetime, "math": math, "result": None
+            }
+            
+            if "GOLD" in ai_symbols:
+                agg_str.append(f"- `gold_df` (Columns: {df_for_ai.columns.tolist()})")
+                raw_str.append(f"- `gold_raw` (Columns: {raw.columns.tolist()})")
+                safe_globals["gold_df"] = df_for_ai
+                safe_globals["gold_raw"] = raw
+            if "DXY" in ai_symbols and raw_dxy is not None:
+                dxy_df = resample_and_calculate(raw_dxy, tf_opt[sel_tf], atr_p)[0]
+                agg_str.append(f"- `dxy_df` (Columns: {dxy_df.columns.tolist()})")
+                raw_str.append(f"- `dxy_raw` (Columns: {raw_dxy.columns.tolist()})")
+                safe_globals["dxy_df"] = dxy_df
+                safe_globals["dxy_raw"] = raw_dxy
+            if "EURUSD" in ai_symbols and raw_eur is not None:
+                eur_df = resample_and_calculate(raw_eur, tf_opt[sel_tf], atr_p)[0]
+                agg_str.append(f"- `eur_df` (Columns: {eur_df.columns.tolist()})")
+                raw_str.append(f"- `eur_raw` (Columns: {raw_eur.columns.tolist()})")
+                safe_globals["eur_df"] = eur_df
+                safe_globals["eur_raw"] = raw_eur
+                
+            agg_text = "\n                ".join(agg_str) if agg_str else "None selected."
+            raw_text = "\n                ".join(raw_str) if raw_str else "None selected."
+            
+            base_prompt = f"""
+            You are a senior quantitative analyst and data scientist with deep expertise in multi-asset financial analysis and Python-based analytical workflows. You write production-quality pandas code: precise, vectorized, and institutionally rigorous.
+
+            You have access ONLY to the following DataFrames in memory representing the user-selected assets:
+            
+            **1. Aggregated Trends (Daily/Session Metrics):**
+            Scope: Filtered by the current sidebar date settings.
+            {agg_text}
+
+            **2. High-Precision History (Full History):**
+            Scope: Unfiltered historical data.
+            {raw_text}
+
+            **User question:**
+            {user_question}
+
+            ## Requirements
+            - Return only raw, executable Python code—no markdown fencing.
+            - Use the DataFrame names exactly as listed above.
+            - For correlation or comparison, merge DataFrames on the 'Time' (raw) or 'Date' (df) columns. Validate they share the time index.
+            - IMPORTANT TIME FILTERING: Do NOT assume 'Year' or 'Month' columns exist. Filter dates using pandas datetime accessors (e.g., `gold_raw[gold_raw['Time'].dt.year == 2026]`).
+            - Store the final answer in a variable named `result`.
+            - You have access to: `pd`, `np`, `px`, `go`, `ta`, `qs`, `stats`, `sk`, `sm`, `arch`, `sns`, `plt`, `pypopt`, `xlsx`, `dt`, `math`.
+            - For visualizations, assign the plotly figure or a seaborn/matplotlib axis to `result`.
+
+            Write Python code only.
+            """
+            
+            # 1. Fetch Code (from Cache or Auto-Healing Loop)
             if cache_key in st.session_state.ai_cache:
                 cached = st.session_state.ai_cache[cache_key]
                 generated_code = cached["code"]
                 usage_text = cached["usage"]
                 st.caption(f"🚀 **Instant Response (Cached)** | {usage_text}")
+                execute_code = True
             else:
-                full_prompt = f"""
-                You are a senior quantitative analyst and data scientist with deep expertise in multi-asset financial analysis and Python-based analytical workflows. You write production-quality pandas code: precise, vectorized, and institutionally rigorous.
-
-                You have access to 6 DataFrames in memory representing 3 major assets:
+                max_retries = 3
+                current_attempt = 1
+                execute_code = False
+                error_feedback = ""
                 
-                **1. Aggregated Trends (Daily/Session Metrics):**
-                - `gold_df`, `dxy_df`, `eur_df`
-                - Scope: Filtered by the current sidebar date settings.
-                - Columns: {df_for_ai.columns.tolist()}
-
-                **2. High-Precision History (Full 5-Year 1-Minute OHLC):**
-                - `gold_raw`, `dxy_raw`, `eur_raw`
-                - Scope: Unfiltered historical data.
-                - Columns: {raw.columns.tolist()}
-
-                **User question:**
-                {user_question}
-
-                ## Requirements
-                - Return only raw, executable Python code—no markdown fencing.
-                - Use the DataFrame names exactly as listed above.
-                - For correlation or comparison, merge DataFrames on the 'Time' (raw) or 'Date' (df) columns.
-                - Store the final answer in a variable named `result`.
-                - You have access to: `pd`, `np`, `px`, `go`, `ta`, `qs`, `stats`, `sk`, `sm`, `arch`, `sns`, `plt`, `pypopt`, `xlsx`, `dt`, `math`.
-                - Use `sk` for ML, `sm` for stats, `arch` for volatility, `pypopt` for portfolio optimization, `dt` for datetime operations, and `math` for mathematical functions.
-                - For visualizations, assign the plotly figure or a seaborn/matplotlib axis to `result`.
-
-                Write Python code only.
-                """
-                
-                try:
-                    if sel_model_name.startswith("groq"):
-                        if not final_groq_key:
-                            st.error("Groq API Key missing!")
-                            st.stop()
-                        client = Groq(api_key=final_groq_key)
-                        g_model = sel_model_name.split("/")[-1]
-                        chat_completion = client.chat.completions.create(
-                            messages=[{"role": "user", "content": full_prompt}],
-                            model=g_model,
-                        )
-                        generated_code = chat_completion.choices[0].message.content.strip()
-                        usage = chat_completion.usage
-                        usage_text = f"Input: `{usage.prompt_tokens}` | Output: `{usage.completion_tokens}` | Total: `{usage.total_tokens}`"
-                        
-                        # Update session totals
-                        st.session_state.total_input_tokens += usage.prompt_tokens
-                        st.session_state.total_output_tokens += usage.completion_tokens
-                        # Estimate cost (Approximation: $0.15 per 1M tokens)
-                        st.session_state.total_cost += (usage.total_tokens / 1_000_000) * 0.15
-                    else:
-                        genai.configure(api_key=final_gemini_key)
-                        model = genai.GenerativeModel(sel_model_name)
-                        response = model.generate_content(full_prompt)
-                        generated_code = response.text.strip()
-                        usage = response.usage_metadata
-                        usage_text = f"Input: `{usage.prompt_token_count}` | Output: `{usage.candidates_token_count}` | Total: `{usage.total_token_count}`"
-                        
-                        # Update session totals
-                        st.session_state.total_input_tokens += usage.prompt_token_count
-                        st.session_state.total_output_tokens += usage.candidates_token_count
-                        # Estimate cost (Approximation: $0.075 per 1M tokens for Flash)
-                        st.session_state.total_cost += (usage.total_token_count / 1_000_000) * 0.075
+                with st.status(f"🤖 AI Quant Engine Analyzing...") as status:
+                    while current_attempt <= max_retries:
+                        if error_feedback:
+                            status.update(label=f"🔄 AI Self-Correcting (Attempt {current_attempt}/{max_retries})...")
+                            prompt_to_send = base_prompt + f"\n\n🚨 PREVIOUS EXECUTION ERROR:\n`{error_feedback}`\nPlease fix the exact error and provide the corrected code. Remember: NO MARKDOWN FENCING, Return python code only."
+                        else:
+                            status.update(label=f"🤖 Generating AI Analysis code (Attempt 1)...")
+                            prompt_to_send = base_prompt
+                            
+                        try:
+                            if sel_model_name.startswith("groq"):
+                                if not final_groq_key:
+                                    st.error("Groq API Key missing!")
+                                    st.stop()
+                                client = Groq(api_key=final_groq_key)
+                                g_model = sel_model_name.split("/")[-1]
+                                chat_completion = client.chat.completions.create(
+                                    messages=[{"role": "user", "content": prompt_to_send}],
+                                    model=g_model,
+                                )
+                                generated_code = chat_completion.choices[0].message.content.strip()
+                                usage = chat_completion.usage
+                                usage_text = f"Input: `{usage.prompt_tokens}` | Output: `{usage.completion_tokens}` | Total: `{usage.total_tokens}`"
+                                
+                                st.session_state.total_input_tokens += usage.prompt_tokens
+                                st.session_state.total_output_tokens += usage.completion_tokens
+                                st.session_state.total_cost += (usage.total_tokens / 1_000_000) * 0.15
+                            else:
+                                genai.configure(api_key=final_gemini_key)
+                                model = genai.GenerativeModel(sel_model_name)
+                                response = model.generate_content(prompt_to_send)
+                                generated_code = response.text.strip()
+                                usage = response.usage_metadata
+                                usage_text = f"Input: `{usage.prompt_token_count}` | Output: `{usage.candidates_token_count}` | Total: `{usage.total_token_count}`"
+                                
+                                st.session_state.total_input_tokens += usage.prompt_token_count
+                                st.session_state.total_output_tokens += usage.candidates_token_count
+                                st.session_state.total_cost += (usage.total_token_count / 1_000_000) * 0.075
+                            
+                            st.write(f"Attempt {current_attempt}: Code generated, executing Dry-Run...")
+                            
+                            # Cleanup formatting artifacts
+                            if "```python" in generated_code:
+                                generated_code = generated_code.split("```python")[-1].split("```")[0].strip()
+                            elif "```" in generated_code:
+                                generated_code = generated_code.split("```")[-1].split("```")[0].strip()
+                            
+                            # DRy RUN (Execution test)
+                            safe_globals["result"] = None
+                            exec(generated_code, safe_globals)
+                            
+                            if safe_globals.get("result") is None:
+                                raise ValueError("You executed the logic but did not assign your final output or chart to the `result` variable. Fix it.")
+                            
+                            # IF SUCCESSFUL
+                            status.update(label="✅ Analysis Complete!", state="complete")
+                            execute_code = True
+                            
+                            # Store in Cache
+                            st.session_state.ai_cache[cache_key] = {
+                                "code": generated_code,
+                                "usage": usage_text
+                            }
+                            st.caption(f"💎 **Token Usage**: {usage_text}")
+                            break # Exit the retry loop!
+                            
+                        except Exception as script_error:
+                            error_feedback = str(script_error)
+                            st.write(f"⚠️ Attempt {current_attempt} failed: {error_feedback}")
+                            current_attempt += 1
                     
-                    st.caption(f"💎 **Token Usage**: {usage_text}")
+                    if not execute_code:
+                        status.update(label=f"❌ AI could not solve the issue after {max_retries} attempts.", state="error")
+                        st.error(f"Final Execution Error: {error_feedback}")
+                        st.code(generated_code, language='python')
 
-                    # Cleanup formatting artifacts
-                    if "```python" in generated_code:
-                        generated_code = generated_code.split("```python")[-1].split("```")[0].strip()
-                    elif "```" in generated_code:
-                        generated_code = generated_code.split("```")[-1].split("```")[0].strip()
-                    
-                    # Store in Cache
-                    st.session_state.ai_cache[cache_key] = {
-                        "code": generated_code,
-                        "usage": usage_text
-                    }
-                except Exception as e:
-                    st.error(f"API Error: {e}")
-                    st.stop()
-            
-            # 2. Execution and Rendering (Shared for both Cache and API flows)
-            try:
-                with st.expander("📝 View AI Quant Code"):
+            # 2. Rendering (Final phase)
+            if execute_code:
+                with st.expander("📝 View AI Quant Code", expanded=False):
                     st.code(generated_code, language='python')
-                
-                # Prepare restricted environment
-                safe_globals = {
-                    "gold_df": df_for_ai,
-                    "gold_raw": raw,
-                    "dxy_df": resample_and_calculate(raw_dxy, tf_opt[sel_tf], atr_p)[0] if raw_dxy is not None else None,
-                    "dxy_raw": raw_dxy,
-                    "eur_df": resample_and_calculate(raw_eur, tf_opt[sel_tf], atr_p)[0] if raw_eur is not None else None,
-                    "eur_raw": raw_eur,
-                    "pd": pd,
-                    "np": np,
-                    "px": px,
-                    "go": go,
-                    "ta": ta,
-                    "qs": qs,
-                    "stats": stats,
-                    "sk": sklearn,
-                    "sm": sm,
-                    "arch": arch_model,
-                    "sns": sns,
-                    "plt": plt,
-                    "pypopt": pypfopt,
-                    "xlsx": xlsxwriter,
-                    "dt": datetime,
-                    "math": math,
-                    "result": None
-                }
-                
-                # Execute code
-                exec(generated_code, safe_globals)
                 
                 st.subheader("💡 Analysis Insight")
                 final_result = safe_globals.get("result")
@@ -791,15 +840,14 @@ with t10:
                     # Check if it's a plotly figure
                     if hasattr(final_result, 'to_dict') and 'data' in final_result.to_dict():
                         # Professional Touch: Ensure AI charts also have no gaps
-                        final_result.update_xaxes(type='category')
+                        try:
+                            final_result.update_xaxes(type='category')
+                        except:
+                            pass
                         st.plotly_chart(final_result, use_container_width=True)
                     else:
                         st.write(final_result)
-                else:
-                    st.info("The AI executed the logic, but no 'result' variable was assigned. Try asking to 'Show the result'.")
-            
-            except Exception as e:
-                st.error(f"Execution Error: {e}")
+
 
         # Session Usage Summary (Footer)
         st.divider()
