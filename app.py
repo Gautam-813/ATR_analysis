@@ -14,6 +14,8 @@ import hashlib
 from statsmodels.tsa.stattools import ccf
 import datetime
 import math
+import requests
+import json
 try:
     from groq import Groq
 except ImportError:
@@ -117,7 +119,7 @@ def load_asset_data(symbol):
     return df
 
 @st.cache_data
-def get_available_models(gemini_key, groq_key=None):
+def get_available_models(gemini_key, groq_key=None, openrouter_key=None):
     models = []
     # 1. Gemini Models
     try:
@@ -127,13 +129,24 @@ def get_available_models(gemini_key, groq_key=None):
     except Exception:
         models.extend(["models/gemini-1.5-flash", "models/gemini-2.0-flash"])
     
-    # 2. Groq Models (Manual list since their API is different)
+    # 2. Groq Models
     if groq_key and Groq:
         models.extend([
             "groq/llama-3.3-70b-versatile",
             "groq/llama-3.1-8b-instant",
             "groq/mixtral-8x7b-32768",
             "groq/deepseek-r1-distill-llama-70b"
+        ])
+
+    # 3. OpenRouter Models (User Requested: Qwen, GLM, Minimax)
+    if openrouter_key:
+        models.extend([
+            "openrouter/qwen/qwen-2.5-72b-instruct:free",
+            "openrouter/qwen/qwen-2-7b-instruct:free",
+            "openrouter/google/gemini-2.0-flash-exp:free",
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+            "openrouter/zhipu/chatglm-9b-instruct",
+            "openrouter/minimax/minimax-01"
         ])
     
     models.sort()
@@ -209,13 +222,16 @@ with st.sidebar.expander("🔑 AI API Keys", expanded=False):
     st.caption("Custom keys are stored in memory and wiped on refresh.")
     u_gemini_key = st.text_input("Gemini API Key", type="password")
     u_groq_key = st.text_input("Groq API Key", type="password")
+    u_or_key = st.text_input("OpenRouter API Key", type="password")
     
     # Resolve keys (Priority: User Input > Secrets)
     final_gemini_key = u_gemini_key if u_gemini_key else st.secrets.get("GEMINI_API_KEY", "")
     final_groq_key = u_groq_key if u_groq_key else st.secrets.get("GROQ_API_KEY", "")
+    final_or_key = u_or_key if u_or_key else st.secrets.get("OPEN_ROUTER", "")
     
     if final_gemini_key: st.success("Gemini: Connected ✅")
     if final_groq_key: st.success("Groq: Connected ✅")
+    if final_or_key: st.success("OpenRouter: Online ✅")
 
 # Load Primary and Secondary Data
 raw = load_asset_data("GOLD")
@@ -648,11 +664,11 @@ with t10:
     st.header("🤖 AI Data Assistant")
     st.markdown("Ask natural language questions about your filtered ATR dataset.")
     
-    if not final_gemini_key and not final_groq_key:
-        st.warning("⚠️ **No API Key Found**: Please enter a Gemini or Groq key in the sidebar to use the AI Assistant.")
+    if not final_gemini_key and not final_groq_key and not final_or_key:
+        st.warning("⚠️ **No API Key Found**: Please enter a Gemini, Groq, or OpenRouter key in the sidebar.")
     else:
         # Resolve Models
-        available_models = get_available_models(final_gemini_key, final_groq_key)
+        available_models = get_available_models(final_gemini_key, final_groq_key, final_or_key)
         
         # 2. Sidebar/Controls for conversation
         c_ai1, c_ai2 = st.columns([1, 2])
@@ -664,7 +680,10 @@ with t10:
                 default_ix = available_models.index("groq/llama-3.3-70b-versatile")
                 
             sel_model_name = st.selectbox("Select AI Model", options=available_models, index=default_ix)
-            st.caption(f"Provider: {'Groq' if sel_model_name.startswith('groq') else 'Google Gemini'}")
+            if sel_model_name.startswith("groq"): provider = "Groq"
+            elif sel_model_name.startswith("openrouter"): provider = "OpenRouter"
+            else: provider = "Google Gemini"
+            st.caption(f"Provider: {provider}")
             if st.button("🗑️ Clear Chat History"):
                 st.session_state.messages = []
                 st.rerun()
@@ -794,6 +813,27 @@ with t10:
                                 st.session_state.total_input_tokens += usage.prompt_tokens
                                 st.session_state.total_output_tokens += usage.completion_tokens
                                 st.session_state.total_cost += (usage.total_tokens / 1_000_000) * 0.15
+                            elif sel_model_name.startswith("openrouter"):
+                                or_model = sel_model_name.replace("openrouter/", "")
+                                headers = {
+                                    "Authorization": f"Bearer {final_or_key}",
+                                    "Content-Type": "application/json"
+                                }
+                                payload = {
+                                    "model": or_model,
+                                    "messages": [{"role": "user", "content": prompt_to_send}]
+                                }
+                                response = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, data=json.dumps(payload))
+                                res_json = response.json()
+                                if "choices" not in res_json:
+                                    raise ValueError(f"OpenRouter Error: {res_json.get('error', 'Unknown Error')}")
+                                
+                                gen_text = res_json["choices"][0]["message"]["content"].strip()
+                                usage = res_json.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+                                usage_text = f"Input: `{usage['prompt_tokens']}` | Output: `{usage['completion_tokens']}`"
+                                st.session_state.total_input_tokens += usage['prompt_tokens']
+                                st.session_state.total_output_tokens += usage['completion_tokens']
+                                st.session_state.total_cost += (usage['total_tokens'] / 1_000_000) * 0.10 # Est avg for paid models
                             else:
                                 genai.configure(api_key=final_gemini_key)
                                 model = genai.GenerativeModel(sel_model_name)
