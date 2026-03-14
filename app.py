@@ -281,6 +281,8 @@ if "total_output_tokens" not in st.session_state:
     st.session_state.total_output_tokens = 0
 if "total_cost" not in st.session_state:
     st.session_state.total_cost = 0.0
+if "messages" not in st.session_state:
+    st.session_state.messages = []
 
 st.divider()
 
@@ -649,13 +651,13 @@ with t10:
     if not final_gemini_key and not final_groq_key:
         st.warning("⚠️ **No API Key Found**: Please enter a Gemini or Groq key in the sidebar to use the AI Assistant.")
     else:
-        # 1. Configuration and Model List
+        # Resolve Models
         available_models = get_available_models(final_gemini_key, final_groq_key)
         
+        # 2. Sidebar/Controls for conversation
         c_ai1, c_ai2 = st.columns([1, 2])
         with c_ai1:
             default_ix = 0
-            # Pick a fast default
             if "models/gemini-2.0-flash" in available_models:
                 default_ix = available_models.index("models/gemini-2.0-flash")
             elif "groq/llama-3.3-70b-versatile" in available_models:
@@ -663,25 +665,46 @@ with t10:
                 
             sel_model_name = st.selectbox("Select AI Model", options=available_models, index=default_ix)
             st.caption(f"Provider: {'Groq' if sel_model_name.startswith('groq') else 'Google Gemini'}")
+            if st.button("🗑️ Clear Chat History"):
+                st.session_state.messages = []
+                st.rerun()
             
         with c_ai2:
-            st.info("💡 **Quant Mode**: Groq models are ultra-fast for code generation.")
+            st.info("💡 **Conversational Quant**: Follow-up questions work! E.g. 'Now make it red'.")
 
-        user_question = st.text_input("Ask a question about the dataset (e.g., 'What was the highest ATR in 2024?')")
+        # 3. Display Chat History
+        for message in st.session_state.messages:
+            with st.chat_message(message["role"]):
+                st.markdown(message["content"])
+                if "code" in message:
+                    with st.expander("📝 View Code"):
+                        st.code(message["code"], language='python')
+                if "result" in message:
+                    res = message["result"]
+                    if hasattr(res, 'to_dict') and 'data' in res.to_dict():
+                        try: res.update_xaxes(type='category')
+                        except: pass
+                        st.plotly_chart(res, use_container_width=True)
+                    else:
+                        st.write(res)
+
+        # 4. Handle Input
+        user_input = st.chat_input("Ask a follow-up or a new question...")
         
-        if user_question:
+        if user_input:
             if not ai_symbols:
                 st.warning("Please select at least one asset in the sidebar for the AI to analyze.")
                 st.stop()
-                
-            # Create unique cache key for this question + model + symbols
-            cache_key = hashlib.md5((user_question + sel_model_name + "".join(ai_symbols)).encode()).hexdigest()
             
-            # Prepare dataframes and globals dynamically
-            df_for_ai = filtered_daily.copy() # Aggregated Gold
+            # Add user message to history
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            # Re-render to show user message immediately
+            with st.chat_message("user"):
+                st.markdown(user_input)
             
-            agg_str = []
-            raw_str = []
+            # Prepare Global Environment for AI code execution
+            df_for_ai = filtered_daily.copy() 
+            agg_str, raw_str = [], []
             safe_globals = {
                 "pd": pd, "np": np, "px": px, "go": go, "ta": ta, "qs": qs, 
                 "stats": stats, "sk": sklearn, "sm": sm, "arch": arch_model, 
@@ -710,71 +733,64 @@ with t10:
             agg_text = "\n                ".join(agg_str) if agg_str else "None selected."
             raw_text = "\n                ".join(raw_str) if raw_str else "None selected."
             
-            base_prompt = f"""
-            You are a senior quantitative analyst and data scientist with deep expertise in multi-asset financial analysis and Python-based analytical workflows. You write production-quality pandas code: precise, vectorized, and institutionally rigorous.
-
-            You have access ONLY to the following DataFrames in memory representing the user-selected assets:
+            # Construct Conversational Context
+            context_history = ""
+            for msg in st.session_state.messages[:-1]: # Include history before this input
+                context_history += f"{msg['role'].upper()}: {msg['content']}\n"
+                if "code" in msg: context_history += f"PREVIOUS CODE GENERATED:\n{msg['code']}\n"
             
+            base_prompt = f"""
+            You are a senior quantitative analyst and data scientist. You write production-quality pandas code.
+            
+            You have access ONLY to the following DataFrames in memory:
             **1. Aggregated Trends (Daily/Session Metrics):**
-            Scope: Filtered by the current sidebar date settings.
             {agg_text}
-
             **2. High-Precision History (Full History):**
-            Scope: Unfiltered historical data.
             {raw_text}
 
-            **User question:**
-            {user_question}
+            ## Conversation History
+            {context_history}
+
+            ## New User Request:
+            {user_input}
 
             ## Requirements
             - Return only raw, executable Python code—no markdown fencing.
-            - Use the DataFrame names exactly as listed above.
-            - For correlation or comparison, merge DataFrames on the 'Time' (raw) or 'Date' (df) columns. Validate they share the time index.
-            - IMPORTANT TIME FILTERING: Do NOT assume 'Year' or 'Month' columns exist. Filter dates using pandas datetime accessors (e.g., `gold_raw[gold_raw['Time'].dt.year == 2026]`).
+            - IMPORTANT: If the user refers to a previous chart or analysis, look at the PREVIOUS CODE in history and modify it to suit the new prompt.
+            - Filter dates using pandas datetime accessors (e.g., `gold_raw[gold_raw['Time'].dt.year == 2026]`).
             - Store the final answer in a variable named `result`.
-            - You have access to: `pd`, `np`, `px`, `go`, `ta`, `qs`, `stats`, `sk`, `sm`, `arch`, `sns`, `plt`, `pypopt`, `xlsx`, `dt`, `math`.
             - For visualizations, assign the plotly figure or a seaborn/matplotlib axis to `result`.
-
             Write Python code only.
             """
             
-            # 1. Fetch Code (from Cache or Auto-Healing Loop)
-            if cache_key in st.session_state.ai_cache:
-                cached = st.session_state.ai_cache[cache_key]
-                generated_code = cached["code"]
-                usage_text = cached["usage"]
-                st.caption(f"🚀 **Instant Response (Cached)** | {usage_text}")
-                execute_code = True
-            else:
-                max_retries = 3
-                current_attempt = 1
-                execute_code = False
-                error_feedback = ""
-                
-                with st.status(f"🤖 AI Quant Engine Analyzing...") as status:
+            # AI Assistant Logic with Auto-Healing
+            max_retries = 3
+            current_attempt = 1
+            final_code = ""
+            final_result = None
+            usage_text = ""
+            error_feedback = ""
+
+            with st.chat_message("assistant"):
+                with st.status("🔍 Quant Engine processing...") as status:
                     while current_attempt <= max_retries:
                         if error_feedback:
-                            status.update(label=f"🔄 AI Self-Correcting (Attempt {current_attempt}/{max_retries})...")
-                            prompt_to_send = base_prompt + f"\n\n🚨 PREVIOUS EXECUTION ERROR:\n`{error_feedback}`\nPlease fix the exact error and provide the corrected code. Remember: NO MARKDOWN FENCING, Return python code only."
+                            status.update(label=f"🔄 Self-Correcting (Attempt {current_attempt})...")
+                            prompt_to_send = base_prompt + f"\n🚨 PREVIOUS EXECUTION ERROR:\n`{error_feedback}`\nFix it! Return code only."
                         else:
-                            status.update(label=f"🤖 Generating AI Analysis code (Attempt 1)...")
                             prompt_to_send = base_prompt
                             
                         try:
+                            # Model dispatch
                             if sel_model_name.startswith("groq"):
-                                if not final_groq_key:
-                                    st.error("Groq API Key missing!")
-                                    st.stop()
                                 client = Groq(api_key=final_groq_key)
-                                g_model = sel_model_name.split("/")[-1]
                                 chat_completion = client.chat.completions.create(
                                     messages=[{"role": "user", "content": prompt_to_send}],
-                                    model=g_model,
+                                    model=sel_model_name.split("/")[-1],
                                 )
-                                generated_code = chat_completion.choices[0].message.content.strip()
+                                gen_text = chat_completion.choices[0].message.content.strip()
                                 usage = chat_completion.usage
-                                usage_text = f"Input: `{usage.prompt_tokens}` | Output: `{usage.completion_tokens}` | Total: `{usage.total_tokens}`"
-                                
+                                usage_text = f"Input: `{usage.prompt_tokens}` | Output: `{usage.completion_tokens}`"
                                 st.session_state.total_input_tokens += usage.prompt_tokens
                                 st.session_state.total_output_tokens += usage.completion_tokens
                                 st.session_state.total_cost += (usage.total_tokens / 1_000_000) * 0.15
@@ -782,71 +798,51 @@ with t10:
                                 genai.configure(api_key=final_gemini_key)
                                 model = genai.GenerativeModel(sel_model_name)
                                 response = model.generate_content(prompt_to_send)
-                                generated_code = response.text.strip()
+                                gen_text = response.text.strip()
                                 usage = response.usage_metadata
-                                usage_text = f"Input: `{usage.prompt_token_count}` | Output: `{usage.candidates_token_count}` | Total: `{usage.total_token_count}`"
-                                
+                                usage_text = f"Input: `{usage.prompt_token_count}` | Output: `{usage.candidates_token_count}`"
                                 st.session_state.total_input_tokens += usage.prompt_token_count
                                 st.session_state.total_output_tokens += usage.candidates_token_count
                                 st.session_state.total_cost += (usage.total_token_count / 1_000_000) * 0.075
+
+                            # Cleanup
+                            if "```python" in gen_text: gen_text = gen_text.split("```python")[-1].split("```")[0].strip()
+                            elif "```" in gen_text: gen_text = gen_text.split("```")[-1].split("```")[0].strip()
                             
-                            st.write(f"Attempt {current_attempt}: Code generated, executing Dry-Run...")
-                            
-                            # Cleanup formatting artifacts
-                            if "```python" in generated_code:
-                                generated_code = generated_code.split("```python")[-1].split("```")[0].strip()
-                            elif "```" in generated_code:
-                                generated_code = generated_code.split("```")[-1].split("```")[0].strip()
-                            
-                            # DRy RUN (Execution test)
+                            # dry run
                             safe_globals["result"] = None
-                            exec(generated_code, safe_globals)
+                            exec(gen_text, safe_globals)
+                            final_result = safe_globals.get("result")
+                            if final_result is None: raise ValueError("`result` variable was not assigned.")
                             
-                            if safe_globals.get("result") is None:
-                                raise ValueError("You executed the logic but did not assign your final output or chart to the `result` variable. Fix it.")
-                            
-                            # IF SUCCESSFUL
+                            final_code = gen_text
                             status.update(label="✅ Analysis Complete!", state="complete")
-                            execute_code = True
-                            
-                            # Store in Cache
-                            st.session_state.ai_cache[cache_key] = {
-                                "code": generated_code,
-                                "usage": usage_text
-                            }
-                            st.caption(f"💎 **Token Usage**: {usage_text}")
-                            break # Exit the retry loop!
-                            
-                        except Exception as script_error:
-                            error_feedback = str(script_error)
-                            st.write(f"⚠️ Attempt {current_attempt} failed: {error_feedback}")
+                            break
+                        except Exception as e:
+                            error_feedback = str(e)
                             current_attempt += 1
                     
-                    if not execute_code:
-                        status.update(label=f"❌ AI could not solve the issue after {max_retries} attempts.", state="error")
-                        st.error(f"Final Execution Error: {error_feedback}")
-                        st.code(generated_code, language='python')
-
-            # 2. Rendering (Final phase)
-            if execute_code:
-                with st.expander("📝 View AI Quant Code", expanded=False):
-                    st.code(generated_code, language='python')
+                    if not final_code:
+                        st.error(f"Quant Engine failed: {error_feedback}")
                 
-                st.subheader("💡 Analysis Insight")
-                final_result = safe_globals.get("result")
-                
-                # Intelligent Rendering
-                if final_result is not None:
-                    # Check if it's a plotly figure
+                # Show Result in current turn
+                if final_code:
+                    with st.expander("📝 View Code"): st.code(final_code, language='python')
                     if hasattr(final_result, 'to_dict') and 'data' in final_result.to_dict():
-                        # Professional Touch: Ensure AI charts also have no gaps
-                        try:
-                            final_result.update_xaxes(type='category')
-                        except:
-                            pass
+                        try: final_result.update_xaxes(type='category')
+                        except: pass
                         st.plotly_chart(final_result, use_container_width=True)
                     else:
                         st.write(final_result)
+                    
+                    # Persist turn
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": "I have updated the analysis based on your request." if "modify" in user_input.lower() else "Analysis complete.",
+                        "code": final_code,
+                        "result": final_result
+                    })
+                    st.caption(f"💎 Usage: {usage_text}")
 
 
         # Session Usage Summary (Footer)
